@@ -3,6 +3,9 @@
 home="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 echo installation directory is $home
 
+# kill the script if it is already running
+sudo pkill -f GitAutoDeploy.py
+
 # copy service files to systemd
 sudo cp $home/gitautodeploy.service /etc/systemd/system/
 

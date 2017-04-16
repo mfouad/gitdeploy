@@ -8,6 +8,7 @@ Type=forking
 WorkingDirectory=HOME_DIR
 ExecStart=HOME_DIR/GitAutoDeploy.py --daemon-mode
 User=USER_NAME
+Group=USER_NAME
 Restart=on-abort
 
 [Install]
