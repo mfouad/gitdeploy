@@ -4,6 +4,7 @@ h1. What is it?
 
 This is a small HTTP server written in python. 
 It allows you to have a version of your project installed, that will be updated automatically on each Github push.
+It can run as a service on Ubuntu 16.04 or later.
 
 To set it up, do the following:
 * install python

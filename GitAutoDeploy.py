@@ -1,73 +1,96 @@
 #!/usr/bin/env python
+""" Runs as an HTTP server and processes GIT HOOK requests """
 
-import json, urlparse, sys, os
+import logging
+import logging.handlers
+import json
+import sys
+import os
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 from subprocess import call
+import argparse
+
+__version__ = '0.2'
+DEFAULT_CONFIG_FILEPATH = './GitAutoDeploy.conf.json'
+
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
+
+LOGGER.addHandler(logging.handlers.SysLogHandler())
+
+def fetch(path):
+    """ executes fetch on a git repo """
+    LOGGER.info('Post push request received, Updating %s', path)
+    call(['cd "' + path + '" && git fetch'], shell=True)
+
+
 
 class GitAutoDeploy(BaseHTTPRequestHandler):
-
-    CONFIG_FILEPATH = './GitAutoDeploy.conf.json'
+    """ Server class, used to parse HTTP git hook requests """
     config = None
     quiet = False
     daemon = False
 
+    def __init__(self, *args, **kwargs):
+        self.event = None
+        self.branch = None
+        self.urls = None
+        BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
+
     @classmethod
-    def getConfig(myClass):
-        if(myClass.config == None):
-            try:
-                configString = open(myClass.CONFIG_FILEPATH).read()
-            except:
-                sys.exit('Could not load ' + myClass.CONFIG_FILEPATH + ' file')
+    def init_config(cls, path):
+        """ reads and parses config file """
+        try:
+            config_string = open(path).read()
+        except EnvironmentError as ex:
+            LOGGER.error('Could not load %s file, error: %s', path, ex)
+            sys.exit()
 
-            try:
-                myClass.config = json.loads(configString)
-            except:
-                sys.exit(myClass.CONFIG_FILEPATH + ' file is not valid json')
+        try:
+            cls.config = json.loads(config_string)
+        except ValueError as ex:
+            LOGGER.error(' %s file is not valid json, error: %s', path, ex)
+            sys.exit()
 
-            for repository in myClass.config['repositories']:
-                if(not os.path.isdir(repository['path'])):
-                    sys.exit('Directory ' + repository['path'] + ' not found')
-                # Check for a repository with a local or a remote GIT_WORK_DIR
-                if not os.path.isdir(os.path.join(repository['path'], '.git')) \
-                   and not os.path.isdir(os.path.join(repository['path'], 'objects')):
-                    sys.exit('Directory ' + repository['path'] + ' is not a Git repository')
-
-        return myClass.config
-
+    # pylint: disable=C0103
     def do_POST(self):
-        isValid = False
+        """ Handles HTTP POST requests """
+        is_valid = False
 
         agent = self.headers.getheader("User-Agent")
 
-        # print User-Agent, helps to diagnose, bitbucket should be "Bitbucket-Webhooks/2.0"
+        # print User-Agent, helps to diagnose, bitbucket should be
+        # "Bitbucket-Webhooks/2.0"
         if not self.quiet:
-            print "User Agent is: ", agent
+            LOGGER.info("User Agent is: %s", agent)
 
         if agent == "Bitbucket-Webhooks/2.0":
-            isValid = self.processBitBucketRequest()
+            is_valid = self.processBitBucketRequest()
         else:
-            isValid = self.processGithubRequest()
+            is_valid = self.processGithubRequest()
 
+        if is_valid:
+            LOGGER.info('git hook request processed')
+        else:
+            LOGGER.error('could not process git hook request')
 
         for url in self.urls:
             paths = self.getMatchingPaths(url)
             for path in paths:
-                self.fetch(path)
+                fetch(path)
                 self.deploy(path)
 
     def processGithubRequest(self):
+        """ For Github git hook requests """
         self.event = self.headers.getheader('X-Github-Event')
-        if not self.quiet:
-            print "Recieved event", self.event
+        LOGGER.info("Recieved event %s", self.event)
 
         if self.event == 'ping':
-            if not self.quiet:
-                print 'Ping event received'
+            LOGGER.info('Ping event received')
             self.respond(204)
             return False
         if self.event != 'push':
-            if not self.quiet:
-                print 'We only handle ping and push events'
+            LOGGER.error('We only handle ping and push events')
             self.respond(304)
             return False
 
@@ -81,13 +104,12 @@ class GitAutoDeploy(BaseHTTPRequestHandler):
         return True
 
     def processBitBucketRequest(self):
+        """ For bitbucket specific git hook requests """
         self.event = self.headers.getheader('X-Event-Key')
-        if not self.quiet:
-            print "Recieved event", self.event
+        LOGGER.info("Recieved event %s", self.event)
 
         if self.event != 'repo:push':
-            if not self.quiet:
-                print 'We only handle ping and push events'
+            LOGGER.wanr('We only handle ping and push events')
             self.respond(304)
             return False
 
@@ -100,76 +122,130 @@ class GitAutoDeploy(BaseHTTPRequestHandler):
 
         return True
 
-
-    def getMatchingPaths(self, repoUrl):
+    @classmethod
+    def getMatchingPaths(cls, repoUrl):
+        """ finds which repo was triggered in the git hook request """
         res = []
-        config = self.getConfig()
-        for repository in config['repositories']:
-            if(repository['url'] == repoUrl):
+        for repository in cls.config['repositories']:
+            if repository['url'] == repoUrl:
                 res.append(repository['path'])
         return res
 
     def respond(self, code):
+        """ sends HTTP response """
         self.send_response(code)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
 
-    def fetch(self, path):
-        if(not self.quiet):
-            print "\nPost push request received"
-            print 'Updating ' + path
-        call(['cd "' + path + '" && git fetch'], shell=True)
 
     def deploy(self, path):
-        config = self.getConfig()
-        for repository in config['repositories']:
-            if(repository['path'] == path):
-                if 'deploy' in repository:
-                    branch = None
-                    if 'branch' in repository:
-                        branch = repository['branch']
+        """ executes deploy script on a git repo, if the pushed branch matches the target branch"""
+        for repository in GitAutoDeploy.config['repositories']:
+            if repository['path'] == path:
+                if repository.get('deploy'):
+                    restrict_branch = repository.get('branch')
+                    # deploy only if the specified branch in config matches the pushed branch
+                    # or if we have no branch specified in config
+                    if restrict_branch is None or restrict_branch == self.branch:
+                        LOGGER.info('Executing deploy command')
+                        call(['cd "' + path + '" && ' +
+                              repository.get('deploy')], shell=True)
+                    else:
+                        LOGGER.warn(
+                            'Push to different branch (%s != %s), not deploying',
+                            restrict_branch, self.branch)
 
-                    if branch is None or branch == self.branch:
-                        if(not self.quiet):
-                            print 'Executing deploy command'
-                        call(['cd "' + path + '" && ' + repository['deploy']], shell=True)
+                return True
+        return False
 
-                    elif not self.quiet:
-                        print 'Push to different branch (%s != %s), not deploying' % (branch, self.branch)
-                break
+    @classmethod
+    def validate(cls):
+        """ validate that repos exist and are really bound to git repos """
+        for repository in cls.config['repositories']:
+            if not os.path.isdir(repository['path']):
+                LOGGER.error('Git Repo at ' + repository['path'] + ' not found')
+                return False
+            # Check for a repository with a local or a remote GIT_WORK_DIR
+            if not os.path.isdir(os.path.join(repository['path'], '.git')) \
+               and not os.path.isdir(os.path.join(repository['path'], 'objects')):
+                LOGGER.error('Directory ' + repository['path'] + ' is not a Git repository')
+                return False
+        return True
+
+    @classmethod
+    def test(cls, hostname):
+        """ not implemented yet, supposed to send a dummy git hook request to the test server"""
+        pass
+
+
+def get_args():
+    """ parses command line args """
+    parser = argparse.ArgumentParser(description='Github Autodeploy Service')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='disable status reporting')
+    parser.add_argument('-d', '--daemon-mode',
+                        action='store_true', help='run this script as a daemon')
+    parser.add_argument('-t', '--test', help='send a test hook event to host')
+    parser.add_argument('-c', '--config', default=DEFAULT_CONFIG_FILEPATH,
+                        help='provide an alternative path for the config file used')
+
+    return parser.parse_args()
+
 
 def main():
+    """ main! """
+    server = None
+    LOGGER.info('Github Autodeploy Service v' + __version__ + ' started')
+    console_handler = logging.StreamHandler()
+    LOGGER.addHandler(console_handler)
     try:
-        server = None
-        for arg in sys.argv:
-            if(arg == '-d' or arg == '--daemon-mode'):
-                GitAutoDeploy.daemon = True
-                GitAutoDeploy.quiet = True
-            if(arg == '-q' or arg == '--quiet'):
-                GitAutoDeploy.quiet = True
+        args = get_args()
 
-        if(GitAutoDeploy.daemon):
+        GitAutoDeploy.quiet = args.quiet or args.daemon_mode
+        GitAutoDeploy.daemon = args.daemon_mode
+        if GitAutoDeploy.quiet:
+            LOGGER.removeHandler(console_handler)
+        GitAutoDeploy.init_config(args.config)
+
+        if not GitAutoDeploy.validate():
+            sys.exit()
+
+        if args.test:
+            GitAutoDeploy.test(args.test)
+
+        if GitAutoDeploy.daemon:
+            LOGGER.info("Forking")
             pid = os.fork()
-            if(pid != 0):
+            if pid:
+                # we are in the parent
+                try:
+                    pid_file = open('/tmp/gitdeploy.pid', 'w')
+                    pid_file.write(str(pid))
+                    pid_file.close()
+                except EnvironmentError as ex:
+                    LOGGER.error("Failed to write to PID file, %s", ex)
+                    sys.exit()
+                LOGGER.info("main proccess exiting")
                 sys.exit()
+            LOGGER.info("fork resuming")
             os.setsid()
 
-        if(not GitAutoDeploy.quiet):
-            print 'Github Autodeploy Service v0.2 started'
-        else:
-            print 'Github Autodeploy Service v 0.2 started in daemon mode'
+        if GitAutoDeploy.daemon:
+            LOGGER.info('Github Autodeploy Service v' +
+                        __version__ + ' started in daemon mode')
 
-        server = HTTPServer(('', GitAutoDeploy.getConfig()['port']), GitAutoDeploy)
+        server = HTTPServer(('', GitAutoDeploy.config['port']), GitAutoDeploy)
+        LOGGER.info("listening on port %d", GitAutoDeploy.config['port'])
         server.serve_forever()
-    except (KeyboardInterrupt, SystemExit) as e:
-        if(e): # wtf, why is this creating a new line?
-            print >> sys.stderr, e
-
-        if(not server is None):
+    # pylint: disable=W0703
+    except (EnvironmentError, KeyboardInterrupt, Exception) as ex:
+        LOGGER.error(ex)
+    finally:
+        if server:
             server.socket.close()
 
-        if(not GitAutoDeploy.quiet):
-            print 'Goodbye'
+        LOGGER.info("quitting..")
+
 
 if __name__ == '__main__':
-     main()
+    main()
